@@ -80,29 +80,38 @@ function Load-LocalConfig {
     if (Test-Path -LiteralPath $ConfigPath) {
         try {
             $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-            if ($config.ApiKey) { $script:ApiKey = $config.ApiKey }
-            if ($config.BaseUrl) { $script:BaseUrl = $config.BaseUrl }
-            if (-not [string]::IsNullOrWhiteSpace($script:BaseUrl)) {
-                $script:BaseUrl = $script:BaseUrl.TrimEnd('/')
-                if (-not $script:BaseUrl.EndsWith('/v1')) {
-                    $script:BaseUrl += '/v1'
-                }
+            if ($config.Profiles) { $script:Profiles = $config.Profiles }
+            if ($config.LastProfile) { $script:LastProfile = $config.LastProfile }
+            
+            # 兼容老配置格式
+            if ($null -eq $script:Profiles -and $config.ApiKey -and $config.BaseUrl) {
+                $script:Profiles = @(
+                    @{
+                        Name = "默认节点"
+                        BaseUrl = $config.BaseUrl
+                        ApiKey = $config.ApiKey
+                        Model = $config.Model
+                    }
+                )
+                $script:LastProfile = "默认节点"
             }
-            if ($config.Model) { $script:Model = $config.Model }
         } catch {}
+    }
+    
+    if ($null -eq $script:Profiles) {
+        $script:Profiles = @()
     }
 }
 
 function Save-LocalConfig {
     $config = @{
-        ApiKey = $script:ApiKey
-        BaseUrl = $script:BaseUrl
-        Model = $script:Model
+        Profiles = $script:Profiles
+        LastProfile = $script:LastProfile
     }
     if (-not (Test-Path -LiteralPath $CodexHome)) {
         New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
     }
-    $configJson = $config | ConvertTo-Json
+    $configJson = $config | ConvertTo-Json -Depth 5
     [System.IO.File]::WriteAllText($ConfigPath, $configJson, [System.Text.UTF8Encoding]::new($false))
 }
 
@@ -128,6 +137,205 @@ function Get-RemoteModels {
     }
 }
 
+
+function Truncate-Visual {
+    param([string]$str, [int]$maxWidth)
+    if ([string]::IsNullOrEmpty($str)) { return "" }
+    $len = 0
+    $result = ""
+    for ($i=0; $i -lt $str.Length; $i++) {
+        if ([int]$str[$i] -gt 255) { $len += 2 } else { $len += 1 }
+        if ($len -gt $maxWidth -and $i -lt $str.Length - 1) {
+            return $result + "..."
+        }
+        $result += $str[$i]
+    }
+    return $result
+}
+
+function Show-InteractiveMenu {
+    param(
+        [string]$Title,
+        [array]$Items,
+        [string]$DisplayProperty,
+        [switch]$MultiSelect,
+        [string]$SelectedProperty,
+        [string]$FooterText
+    )
+
+    $Host.UI.RawUI.CursorSize = 0
+    $selectedIndex = 0
+
+    while ($true) {
+        Clear-Host
+        Write-Host "========== $Title ==========" -ForegroundColor Green
+        
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $item = $Items[$i]
+            $prefix = "   "
+            $color = "Gray"
+            if ($i -eq $selectedIndex) {
+                $prefix = " > "
+                $color = "Cyan"
+            }
+            
+            $text = ""
+            if ($MultiSelect) {
+                $isChecked = $item.$SelectedProperty
+                if ($isChecked) {
+                    $prefix += "[√] "
+                    if ($color -eq "Gray") { $color = "White" }
+                } else {
+                    $prefix += "[ ] "
+                }
+            } else {
+                $prefix += "[ ] "
+            }
+            
+            $text = $item.$DisplayProperty
+            
+            $maxWidth = $Host.UI.RawUI.WindowSize.Width - 10
+            $truncated = Truncate-Visual -str $text -maxWidth $maxWidth
+            Write-Host "$prefix$truncated" -ForegroundColor $color
+        }
+        
+        if ($FooterText) {
+            Write-Host ""
+            Write-Host $FooterText -ForegroundColor Yellow
+        }
+
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Character
+        $keyCode = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").VirtualKeyCode
+        
+        if ($keyCode -eq 38 -or $key -eq 'w' -or $key -eq 'W') {
+            $selectedIndex--
+            if ($selectedIndex -lt 0) { $selectedIndex = $Items.Count - 1 }
+        }
+        elseif ($keyCode -eq 40 -or $key -eq 's' -or $key -eq 'S') {
+            $selectedIndex++
+            if ($selectedIndex -ge $Items.Count) { $selectedIndex = 0 }
+        }
+        elseif ($keyCode -eq 32) { # Space
+            if ($MultiSelect) {
+                $item = $Items[$selectedIndex]
+                if ($item.IsAction) {
+                    return $item
+                } else {
+                    $item.$SelectedProperty = -not $item.$SelectedProperty
+                }
+            }
+        }
+        elseif ($keyCode -eq 13) { # Enter
+            $item = $Items[$selectedIndex]
+            if ($MultiSelect) {
+                if ($item.IsAction) {
+                    return $item
+                } else {
+                    $item.$SelectedProperty = -not $item.$SelectedProperty
+                }
+            } else {
+                return $item
+            }
+        }
+        elseif ($keyCode -eq 27) { # Esc
+            return $null
+        }
+    }
+}
+
+function Manage-ApiNodes {
+    Load-LocalConfig
+    
+    while ($true) {
+        $menuItems = New-Object System.Collections.Generic.List[object]
+        
+        if ($script:Profiles) {
+            foreach ($profile in $script:Profiles) {
+                $displayName = "$($profile.Name) ($($profile.BaseUrl))"
+                if ($profile.Name -eq $script:LastProfile) {
+                    $displayName = "* " + $displayName
+                }
+                $menuItems.Add([pscustomobject]@{ Display = $displayName; Action = 'Select'; Profile = $profile })
+            }
+        }
+        
+        $menuItems.Add([pscustomobject]@{ Display = "------------------------------------"; Action = 'None' })
+        $menuItems.Add([pscustomobject]@{ Display = "[新建 API 节点]"; Action = 'New' })
+        if ($script:Profiles.Count -gt 0) {
+            $menuItems.Add([pscustomobject]@{ Display = "[编辑 API 节点]"; Action = 'Edit' })
+            $menuItems.Add([pscustomobject]@{ Display = "[删除 API 节点]"; Action = 'Delete' })
+        }
+        $menuItems.Add([pscustomobject]@{ Display = "[退出系统]"; Action = 'Exit' })
+
+        $choice = Show-InteractiveMenu -Title "请选择或管理 API 节点" -Items $menuItems -DisplayProperty "Display" -FooterText "使用 ↑↓ 切换，回车确认"
+        
+        if ($null -eq $choice -or $choice.Action -eq 'Exit') { exit 0 }
+        if ($choice.Action -eq 'None') { continue }
+        if ($choice.Action -eq 'Select') {
+            $script:LastProfile = $choice.Profile.Name
+            Save-LocalConfig
+            return $choice.Profile
+        }
+        
+        if ($choice.Action -eq 'New') {
+            Clear-Host
+            Write-Host "========== 新建 API 节点 ==========" -ForegroundColor Green
+            $name = Read-Host "输入节点名称 (例如 Codex Default)"
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            
+            $url = Read-Host "输入 Base URL (例如 https://www.codexcc.site)"
+            if ([string]::IsNullOrWhiteSpace($url)) { continue }
+            $url = $url.TrimEnd('/')
+            if (-not $url.EndsWith('/v1')) { $url += '/v1' }
+            
+            $key = Read-Host "输入 API Key"
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            
+            $newProfile = [pscustomobject]@{ Name = $name; BaseUrl = $url; ApiKey = $key; Model = "" }
+            $script:Profiles += $newProfile
+            $script:LastProfile = $name
+            Save-LocalConfig
+        }
+        
+        if ($choice.Action -eq 'Edit') {
+            $editItems = New-Object System.Collections.Generic.List[object]
+            foreach ($profile in $script:Profiles) { $editItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile }) }
+            $editItems.Add([pscustomobject]@{ Display = "[返回]"; Action = 'Back' })
+            $editChoice = Show-InteractiveMenu -Title "选择要编辑的节点" -Items $editItems -DisplayProperty "Display"
+            if ($null -ne $editChoice -and $editChoice.Action -ne 'Back') {
+                Clear-Host
+                Write-Host "========== 编辑 API 节点: $($editChoice.Profile.Name) ==========" -ForegroundColor Green
+                $newName = Read-Host "名称 [$($editChoice.Profile.Name)] (回车保持不变)"
+                if (-not [string]::IsNullOrWhiteSpace($newName)) { $editChoice.Profile.Name = $newName }
+                $newUrl = Read-Host "Base URL [$($editChoice.Profile.BaseUrl)] (回车保持不变)"
+                if (-not [string]::IsNullOrWhiteSpace($newUrl)) {
+                    $newUrl = $newUrl.TrimEnd('/')
+                    if (-not $newUrl.EndsWith('/v1')) { $newUrl += '/v1' }
+                    $editChoice.Profile.BaseUrl = $newUrl
+                }
+                $newKey = Read-Host "API Key [****] (回车保持不变)"
+                if (-not [string]::IsNullOrWhiteSpace($newKey)) { $editChoice.Profile.ApiKey = $newKey }
+                Save-LocalConfig
+            }
+        }
+        
+        if ($choice.Action -eq 'Delete') {
+            $delItems = New-Object System.Collections.Generic.List[object]
+            foreach ($profile in $script:Profiles) { $delItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile }) }
+            $delItems.Add([pscustomobject]@{ Display = "[返回]"; Action = 'Back' })
+            $delChoice = Show-InteractiveMenu -Title "选择要删除的节点" -Items $delItems -DisplayProperty "Display"
+            if ($null -ne $delChoice -and $delChoice.Action -ne 'Back') {
+                $newProfiles = @()
+                foreach ($profile in $script:Profiles) {
+                    if ($profile.Name -ne $delChoice.Profile.Name) { $newProfiles += $profile }
+                }
+                $script:Profiles = $newProfiles
+                if ($script:LastProfile -eq $delChoice.Profile.Name) { $script:LastProfile = "" }
+                Save-LocalConfig
+            }
+        }
+    }
+}
 
 function Use-EnvOverride {
     param(
@@ -648,81 +856,64 @@ function Collect-SessionDigest {
 
 # 【核心逻辑】扫描会话文件：同时从实时 sessions 和归档 archived_sessions 中抓取当天的记录
 function Discover-MatchingSessions {
-    param(
-        [string]$ReportDateValue,
-        [string]$RepoRoot,
-        [string]$CodexHomeValue
-    )
+    param([string]$ReportDateValue, [string]$RepoRoot, [string]$CodexHomeValue)
 
-    $digests = New-Object System.Collections.Generic.List[object]
     $parsedDate = [datetime]::ParseExact($ReportDateValue, 'yyyy-MM-dd', $null)
-    $targetDateStr = $parsedDate.ToString('yyyy-MM-dd')
-    
     $sessionRoot = Join-Path $CodexHomeValue 'sessions'
-    $archivedRoot = Join-Path $CodexHomeValue 'archived_sessions'
-    
-    $allFiles = New-Object System.Collections.Generic.List[object]
-    
-    # Add files from current day's sessions folder
-    $sessionYear = $parsedDate.ToString('yyyy')
-    $sessionMonth = $parsedDate.ToString('MM')
-    $sessionDay = $parsedDate.ToString('dd')
-    $sessionDir = Join-Path (Join-Path (Join-Path $sessionRoot $sessionYear) $sessionMonth) $sessionDay
-    if (Test-Path -LiteralPath $sessionDir) {
-        Get-ChildItem -LiteralPath $sessionDir -Filter '*.jsonl' | ForEach-Object { [void]$allFiles.Add($_) }
-    }
-    
-    # Add files from archived_sessions that were modified on the target date
-    if (Test-Path -LiteralPath $archivedRoot) {
-        Get-ChildItem -Path $archivedRoot -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue | Where-Object {
-            $_.LastWriteTime.ToString('yyyy-MM-dd') -eq $targetDateStr -or $_.CreationTime.ToString('yyyy-MM-dd') -eq $targetDateStr
-        } | ForEach-Object {
-            $f = $_
-            $alreadyExists = $false
-            foreach ($existing in $allFiles) { if ($existing.FullName -eq $f.FullName) { $alreadyExists = $true; break } }
-            if (-not $alreadyExists) { [void]$allFiles.Add($f) }
-        }
+    $digests = New-Object System.Collections.Generic.List[object]
+
+    if (-not (Test-Path -LiteralPath $sessionRoot)) { return $digests }
+
+    $foldersToScan = @()
+    for ($i = 0; $i -le 7; $i++) {
+        $dateToCheck = $parsedDate.AddDays(-$i)
+        $dir = Join-Path (Join-Path (Join-Path $sessionRoot $dateToCheck.ToString('yyyy')) $dateToCheck.ToString('MM')) $dateToCheck.ToString('dd')
+        if (Test-Path -LiteralPath $dir) { $foldersToScan += $dir }
     }
 
-    $files = @($allFiles | Sort-Object LastWriteTime)
-    for ($i=0; $i -lt $files.Count; $i++) {
-        $file = $files[$i]
-        Write-Spinner "正在解析会话文件 ($($i+1)/$($files.Count)): $($file.Name)"
+    $allFiles = @()
+    foreach ($folder in $foldersToScan) {
+        $allFiles += @(Get-ChildItem -LiteralPath $folder -Filter '*.jsonl')
+    }
+
+    for ($i=0; $i -lt $allFiles.Count; $i++) {
+        $file = $allFiles[$i]
+        if ($file.LastWriteTime.ToString('yyyy-MM-dd') -ne $ReportDateValue) { continue }
+
+        Write-Spinner "正在解析会话文件 ($($i+1)/$($allFiles.Count)): $($file.Name)"
         $digest = Collect-SessionDigest -SessionFile $file.FullName -RepoRoot $RepoRoot
         if ($null -ne $digest) {
-            # Extract alias
             $alias = "未命名会话"
             $creationTime = $file.CreationTime.ToString('yyyy-MM-dd HH:mm:ss')
-            $lines = Get-Content $file.FullName -TotalCount 100 -Encoding UTF8 -ErrorAction SilentlyContinue
-            if ($lines) {
-                foreach ($line in $lines) {
-                    if ($line -match '"alias"\s*:\s*"([^"]+)"') {
-                        $alias = $Matches[1]
-                        break
-                    } elseif ($line -match '"title"\s*:\s*"([^"]+)"') {
-                        $alias = $Matches[1]
-                        break
-                    }
+            
+            $fileContent = Get-Content $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue
+            $foundAlias = $false
+            foreach ($line in $fileContent) {
+                if ($line -match '"alias"\s*:\s*"([^"]+)"' -or $line -match '"title"\s*:\s*"([^"]+)"') {
+                    $alias = $Matches[1]
+                    $foundAlias = $true
+                    break
                 }
             }
-            
-            $preview = ""
-            if ($digest.UserMessages.Count -gt 0) {
-                $preview = $digest.UserMessages[0]
-                $preview = $preview -replace '[\r\n]+', ' '
-                if ($preview.Length -gt 55) { $preview = $preview.Substring(0, 52) + "..." }
+            if (-not $foundAlias -and $digest.UserMessages.Count -gt 0) {
+                $firstMsg = $digest.UserMessages[0]
+                $alias = if ($firstMsg.Length -gt 25) { $firstMsg.Substring(0, 25) + "..." } else { $firstMsg }
             }
-            
+
             $digest | Add-Member -MemberType NoteProperty -Name "Alias" -Value $alias
             $digest | Add-Member -MemberType NoteProperty -Name "CreationTime" -Value $creationTime
-            $digest | Add-Member -MemberType NoteProperty -Name "Preview" -Value $preview
             $digest | Add-Member -MemberType NoteProperty -Name "Selected" -Value $true
             
             [void]$digests.Add($digest)
         }
     }
     Clear-Spinner
-
+    
+    if ($digests.Count -gt 0) {
+        $sorted = $digests | Sort-Object CreationTime -Descending
+        $digests.Clear()
+        foreach ($s in $sorted) { [void]$digests.Add($s) }
+    }
     return $digests
 }
 
@@ -1167,48 +1358,41 @@ function Build-ReportMarkdown {
 # ==========================================
 # 程序执行主入口
 # ==========================================
-# 加载并检查配置
-Load-LocalConfig
-if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-    Write-Host "首次使用，请输入您的 API Key (将加密保存至 $ConfigPath):" -ForegroundColor Yellow
-    $ApiKey = Read-Host "Key"
-    Save-LocalConfig
-}
-if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
-    Write-Host "请输入您的 Base URL (例如 https://www.codexcc.site/v1):" -ForegroundColor Yellow
-    $BaseUrl = Read-Host "URL"
-    if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
-        $BaseUrl = $BaseUrl.TrimEnd('/')
-        if (-not $BaseUrl.EndsWith('/v1')) {
-            $BaseUrl += '/v1'
-        }
-    }
-    Save-LocalConfig
-}
-if ([string]::IsNullOrWhiteSpace($Model)) {
+$currentProfile = Manage-ApiNodes
+$script:ApiKey = $currentProfile.ApiKey
+$script:BaseUrl = $currentProfile.BaseUrl
+$script:Model = $currentProfile.Model
+
+if ([string]::IsNullOrWhiteSpace($script:Model)) {
     Write-Spinner "正在从服务器获取可用模型列表..."
-    $models = Get-RemoteModels -Url $BaseUrl -Key $ApiKey
+    $models = Get-RemoteModels -Url $script:BaseUrl -Key $script:ApiKey
     Clear-Spinner
     
     if ($null -ne $models -and $models.Count -gt 0) {
-        Write-Host "`n从服务器获取到以下模型，请输入序号选择:" -ForegroundColor Cyan
-        for ($i=0; $i -lt $models.Count; $i++) {
-            Write-Host " [$($i+1)] $($models[$i])"
-        }
-        $mChoice = Read-Host "`n选择模型 (直接回车默认使用第1个)"
-        if ($mChoice -match '^\d+$' -and [int]$mChoice -ge 1 -and [int]$mChoice -le $models.Count) {
-            $Model = $models[[int]$mChoice - 1]
+        $modelItems = New-Object System.Collections.Generic.List[object]
+        foreach ($m in $models) { $modelItems.Add([pscustomobject]@{ Display = $m; Value = $m }) }
+        $mChoice = Show-InteractiveMenu -Title "从服务器获取到以下模型，请勾选选择" -Items $modelItems -DisplayProperty "Display"
+        if ($null -ne $mChoice) {
+            $script:Model = $mChoice.Value
         } else {
-            $Model = $models[0]
+            $script:Model = $models[0]
         }
     } else {
-        $Model = Read-Host "未获取到模型列表，请手动输入模型名称 (例如 gpt-4o)"
+        $script:Model = Read-Host "未获取到模型列表，请手动输入模型名称 (例如 gpt-4o)"
+    }
+    
+    foreach ($p in $script:Profiles) {
+        if ($p.Name -eq $currentProfile.Name) {
+            $p.Model = $script:Model
+            break
+        }
     }
     Save-LocalConfig
 }
 
 $repoRoot = Normalize-PathValue $WorkDir
 $codexHomeRoot = Normalize-PathValue $CodexHome
+$outputDirRoot = Normalize-PathValue $OutputDir
 $outputDirRoot = Normalize-PathValue $OutputDir
 
 if (-not (Test-Path -LiteralPath $repoRoot)) {
