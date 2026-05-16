@@ -179,21 +179,26 @@ function Show-InteractiveMenu {
                 $color = "Cyan"
             }
             
-            $text = ""
             if ($MultiSelect) {
-                $isChecked = $item.$SelectedProperty
-                if ($isChecked) {
-                    $prefix += "[√] "
-                    if ($color -eq "Gray") { $color = "White" }
+                if ($null -ne $item.IsAction -and $item.IsAction) {
+                    # Actions in multi-select don't get [ ]
                 } else {
-                    $prefix += "[ ] "
+                    $isChecked = $item.$SelectedProperty
+                    if ($isChecked) {
+                        $prefix += "[√] "
+                        if ($color -eq "Gray") { $color = "White" }
+                    } else {
+                        $prefix += "[ ] "
+                    }
                 }
+            } elseif ($null -ne $item.Action -and $item.Action -ne 'Select') {
+                # Single-select actions (New/Edit/Delete) don't get [ ]
             } else {
+                # Regular selectable items get [ ]
                 $prefix += "[ ] "
             }
             
             $text = $item.$DisplayProperty
-            
             $maxWidth = $Host.UI.RawUI.WindowSize.Width - 10
             $truncated = Truncate-Visual -str $text -maxWidth $maxWidth
             Write-Host "$prefix$truncated" -ForegroundColor $color
@@ -204,21 +209,32 @@ function Show-InteractiveMenu {
             Write-Host $FooterText -ForegroundColor Yellow
         }
 
-        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Character
-        $keyCode = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").VirtualKeyCode
+        $keyInfo = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        $key = $keyInfo.Character
+        $keyCode = $keyInfo.VirtualKeyCode
         
         if ($keyCode -eq 38 -or $key -eq 'w' -or $key -eq 'W') {
             $selectedIndex--
             if ($selectedIndex -lt 0) { $selectedIndex = $Items.Count - 1 }
+            # Skip separators
+            if ($Items[$selectedIndex].Action -eq 'None') {
+                $selectedIndex--
+                if ($selectedIndex -lt 0) { $selectedIndex = $Items.Count - 1 }
+            }
         }
         elseif ($keyCode -eq 40 -or $key -eq 's' -or $key -eq 'S') {
             $selectedIndex++
             if ($selectedIndex -ge $Items.Count) { $selectedIndex = 0 }
+            # Skip separators
+            if ($Items[$selectedIndex].Action -eq 'None') {
+                $selectedIndex++
+                if ($selectedIndex -ge $Items.Count) { $selectedIndex = 0 }
+            }
         }
         elseif ($keyCode -eq 32) { # Space
             if ($MultiSelect) {
                 $item = $Items[$selectedIndex]
-                if ($item.IsAction) {
+                if ($null -ne $item.IsAction -and $item.IsAction) {
                     return $item
                 } else {
                     $item.$SelectedProperty = -not $item.$SelectedProperty
@@ -227,8 +243,9 @@ function Show-InteractiveMenu {
         }
         elseif ($keyCode -eq 13) { # Enter
             $item = $Items[$selectedIndex]
+            if ($item.Action -eq 'None') { continue }
             if ($MultiSelect) {
-                if ($item.IsAction) {
+                if ($null -ne $item.IsAction -and $item.IsAction) {
                     return $item
                 } else {
                     $item.$SelectedProperty = -not $item.$SelectedProperty
@@ -253,7 +270,7 @@ function Manage-ApiNodes {
             foreach ($profile in $script:Profiles) {
                 $displayName = "$($profile.Name) ($($profile.BaseUrl))"
                 if ($profile.Name -eq $script:LastProfile) {
-                    $displayName = "* " + $displayName
+                    $displayName = "[使用中] " + $displayName
                 }
                 $menuItems.Add([pscustomobject]@{ Display = $displayName; Action = 'Select'; Profile = $profile })
             }
@@ -267,7 +284,7 @@ function Manage-ApiNodes {
         }
         $menuItems.Add([pscustomobject]@{ Display = "[退出系统]"; Action = 'Exit' })
 
-        $choice = Show-InteractiveMenu -Title "请选择或管理 API 节点" -Items $menuItems -DisplayProperty "Display" -FooterText "使用 ↑↓ 切换，回车确认"
+        $choice = Show-InteractiveMenu -Title "请选择 API 节点或管理配置" -Items $menuItems -DisplayProperty "Display" -FooterText "使用 ↑↓ 切换，回车确认"
         
         if ($null -eq $choice -or $choice.Action -eq 'Exit') { exit 0 }
         if ($choice.Action -eq 'None') { continue }
@@ -282,15 +299,12 @@ function Manage-ApiNodes {
             Write-Host "========== 新建 API 节点 ==========" -ForegroundColor Green
             $name = Read-Host "输入节点名称 (例如 Codex Default)"
             if ([string]::IsNullOrWhiteSpace($name)) { continue }
-            
             $url = Read-Host "输入 Base URL (例如 https://www.codexcc.site)"
             if ([string]::IsNullOrWhiteSpace($url)) { continue }
             $url = $url.TrimEnd('/')
             if (-not $url.EndsWith('/v1')) { $url += '/v1' }
-            
             $key = Read-Host "输入 API Key"
             if ([string]::IsNullOrWhiteSpace($key)) { continue }
-            
             $newProfile = [pscustomobject]@{ Name = $name; BaseUrl = $url; ApiKey = $key; Model = "" }
             $script:Profiles += $newProfile
             $script:LastProfile = $name
@@ -299,10 +313,11 @@ function Manage-ApiNodes {
         
         if ($choice.Action -eq 'Edit') {
             $editItems = New-Object System.Collections.Generic.List[object]
-            foreach ($profile in $script:Profiles) { $editItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile }) }
+            foreach ($profile in $script:Profiles) { $editItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile; Action = 'Select' }) }
+            $editItems.Add([pscustomobject]@{ Display = "---"; Action = 'None' })
             $editItems.Add([pscustomobject]@{ Display = "[返回]"; Action = 'Back' })
             $editChoice = Show-InteractiveMenu -Title "选择要编辑的节点" -Items $editItems -DisplayProperty "Display"
-            if ($null -ne $editChoice -and $editChoice.Action -ne 'Back') {
+            if ($null -ne $editChoice -and $editChoice.Action -eq 'Select') {
                 Clear-Host
                 Write-Host "========== 编辑 API 节点: $($editChoice.Profile.Name) ==========" -ForegroundColor Green
                 $newName = Read-Host "名称 [$($editChoice.Profile.Name)] (回车保持不变)"
@@ -321,10 +336,11 @@ function Manage-ApiNodes {
         
         if ($choice.Action -eq 'Delete') {
             $delItems = New-Object System.Collections.Generic.List[object]
-            foreach ($profile in $script:Profiles) { $delItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile }) }
+            foreach ($profile in $script:Profiles) { $delItems.Add([pscustomobject]@{ Display = $profile.Name; Profile = $profile; Action = 'Select' }) }
+            $delItems.Add([pscustomobject]@{ Display = "---"; Action = 'None' })
             $delItems.Add([pscustomobject]@{ Display = "[返回]"; Action = 'Back' })
             $delChoice = Show-InteractiveMenu -Title "选择要删除的节点" -Items $delItems -DisplayProperty "Display"
-            if ($null -ne $delChoice -and $delChoice.Action -ne 'Back') {
+            if ($null -ne $delChoice -and $delChoice.Action -eq 'Select') {
                 $newProfiles = @()
                 foreach ($profile in $script:Profiles) {
                     if ($profile.Name -ne $delChoice.Profile.Name) { $newProfiles += $profile }
