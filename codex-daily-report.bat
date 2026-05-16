@@ -1383,7 +1383,7 @@ if ([string]::IsNullOrWhiteSpace($script:Model)) {
     
     foreach ($p in $script:Profiles) {
         if ($p.Name -eq $currentProfile.Name) {
-            $p.Model = $script:Model
+            $p | Add-Member -MemberType NoteProperty -Name "Model" -Value $script:Model -Force
             break
         }
     }
